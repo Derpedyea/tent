@@ -12,6 +12,9 @@ anyhow = "1"
 async-channel = "2"
 serialport = { version = "4.10", default-features = false }
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3"
+
 [profile.release]
 lto = "thin"
 codegen-units = 4

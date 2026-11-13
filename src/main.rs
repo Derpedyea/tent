@@ -1,5 +1,8 @@
 //! tent — a small telnet and serial terminal. GPUI for the UI, Ghostty's VT core for the terminal.
 
+// Release builds on Windows are GUI apps: no console window behind tent.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod connect;
 mod net;
 mod session;

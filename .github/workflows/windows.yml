@@ -1,0 +1,86 @@
+name: windows
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write # attach tent-setup.exe to releases on tags
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            installer -> ../target/installer
+
+      - name: Build tent.exe
+        run: cargo build --release --locked
+
+      - name: Build tent-setup.exe
+        shell: pwsh
+        run: |
+          if (-not (Get-Command zstd -ErrorAction SilentlyContinue)) { choco install zstandard -y --no-progress }
+          New-Item -ItemType Directory -Force target/dist, dist | Out-Null
+          zstd -19 -T0 -q -f target/release/tent.exe -o target/dist/tent.zst
+          $env:TENT_PAYLOAD = "$PWD/target/dist/tent.zst"
+          cargo build --release --locked --manifest-path installer/Cargo.toml --target-dir target/installer
+          Copy-Item target/installer/release/tent-setup.exe dist/
+          Copy-Item target/release/tent.exe dist/
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Smoke test (install, launch, uninstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:LOCALAPPDATA\Programs\tent"
+          $p = Start-Process dist/tent-setup.exe -ArgumentList '--silent' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "install exit $($p.ExitCode)" }
+          foreach ($f in "$dir\tent.exe", "$dir\uninstall.exe", "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\tent.lnk") {
+            if (-not (Test-Path $f)) { throw "missing $f" }
+          }
+          $u = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\tent'
+          "uninstall: $($u.UninstallString)"
+          "telnet: " + (Get-ItemProperty 'HKCU:\Software\Classes\telnet\shell\open\command').'(default)'
+
+          $t = Start-Process "$dir\tent.exe" -PassThru
+          Start-Sleep 8
+          if ($t.HasExited) { throw "tent exited early with $($t.ExitCode)" }
+          Add-Type -AssemblyName System.Windows.Forms, System.Drawing
+          $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+          $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+          [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+          $bmp.Save("$PWD/dist/screenshot.png")
+          Stop-Process -Id $t.Id
+          Start-Sleep 1
+
+          Start-Process "$dir\uninstall.exe" -ArgumentList '--uninstall', '--silent' -Wait
+          for ($i = 0; $i -lt 30 -and (Test-Path $dir); $i++) { Start-Sleep 1 }
+          if (Test-Path $dir) { Get-ChildItem $dir; throw "install dir still there" }
+          if (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\tent') { throw "uninstall key still there" }
+          if (Test-Path 'HKCU:\Software\Classes\telnet') { throw "telnet handler still there" }
+          "uninstall ok"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tent-windows
+          path: dist/
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$env:GITHUB_REF_NAME" dist/tent-setup.exe --clobber
