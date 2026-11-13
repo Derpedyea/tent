@@ -77,7 +77,7 @@ impl Connect {
     fn reveal(&self) {
         match self.selected {
             Some(i) => {
-                let headers = if self.recent.is_empty() { 1 } else if i < self.recent.len() { 1 } else { 2 };
+                let headers = if self.recent.is_empty() || i < self.recent.len() { 1 } else { 2 };
                 self.scroll.scroll_to_item(i + headers);
             }
             None => self.scroll.scroll_to_item(0),
