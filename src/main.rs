@@ -1,8 +1,9 @@
-//! tent — a small telnet client. GPUI for the UI, Ghostty's VT core for the terminal.
+//! tent — a small telnet and serial terminal. GPUI for the UI, Ghostty's VT core for the terminal.
 
 mod connect;
 mod net;
 mod session;
+mod target;
 mod telnet;
 mod theme;
 
@@ -16,6 +17,7 @@ use gpui::{
 
 use connect::{Connect, ConnectEvent};
 use session::{Session, SessionEvent};
+use target::Target;
 
 enum Screen {
     Connect,
@@ -29,25 +31,26 @@ struct Root {
 }
 
 impl Root {
-    fn new(target: Option<(String, u16)>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(target: Option<Target>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let connect = cx.new(Connect::new);
         let sub = cx.subscribe_in(&connect, window, |this, _, ev: &ConnectEvent, window, cx| match ev {
-            ConnectEvent::Open(host, port) => this.open(host.clone(), *port, window, cx),
+            ConnectEvent::Open(t) => this.open(t.clone(), window, cx),
         });
         let mut this = Self { connect, screen: Screen::Connect, _sub: sub };
         match target {
-            Some((host, port)) => {
-                this.connect.update(cx, |c, _| c.remember(&host, port));
-                this.open(host, port, window, cx);
-            }
+            Some(t) => this.open(t, window, cx),
             None => this.show_connect(window, cx),
         }
         this
     }
 
-    fn open(&mut self, host: String, port: u16, window: &mut Window, cx: &mut Context<Self>) {
-        let session = cx.new(|cx| Session::new(host, port, window, cx));
-        let sub = cx.subscribe_in(&session, window, |this, _, ev: &SessionEvent, window, cx| match ev {
+    fn open(&mut self, target: Target, window: &mut Window, cx: &mut Context<Self>) {
+        let session = cx.new(|cx| Session::new(target, window, cx));
+        let sub = cx.subscribe_in(&session, window, |this, s, ev: &SessionEvent, window, cx| match ev {
+            SessionEvent::Connected => {
+                let t = s.read(cx).target.clone();
+                this.connect.update(cx, |c, _| c.remember(&t));
+            }
             SessionEvent::Back => this.show_connect(window, cx),
         });
         self.screen = Screen::Session { view: session, _sub: sub };
@@ -83,7 +86,7 @@ const FONTS: [&[u8]; 4] = [
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("usage: tent [host[:port] | host port | telnet://host:port]");
+        println!("usage: tent [host[:port] | telnet://host:port | <serial port> [baud] [8N1]]");
         return;
     }
     if args.iter().any(|a| a == "-V" || a == "--version") {
@@ -92,7 +95,7 @@ fn main() {
     }
     let target = match args.join(" ").trim() {
         "" => None,
-        t => match connect::parse_target(t) {
+        t => match target::parse_target(t) {
             Ok(t) => Some(t),
             Err(e) => {
                 eprintln!("tent: {e}");

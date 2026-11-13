@@ -1,4 +1,4 @@
-//! A telnet session: socket + telnet protocol + Ghostty VT + GPUI renderer.
+//! A session: socket or serial port + telnet protocol + Ghostty VT + GPUI renderer.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -19,6 +19,7 @@ use libghostty_vt::{
 };
 
 use crate::net::{Connection, NetEvent};
+use crate::target::Target;
 use crate::telnet::Telnet;
 use crate::theme::{self, c};
 
@@ -32,19 +33,21 @@ pub enum Status {
 }
 
 pub enum SessionEvent {
+    /// The transport opened; worth adding to recents.
+    Connected,
     Back,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
 
 pub struct Session {
-    pub host: String,
-    pub port: u16,
+    pub target: Target,
     pub status: Status,
     focus: FocusHandle,
     conn: Option<Connection>,
     _reader: Option<Task<()>>,
-    telnet: Telnet,
+    /// None for serial: raw bytes, no option negotiation.
+    telnet: Option<Telnet>,
     term: Terminal<'static, 'static>,
     render: RenderState<'static>,
     rows_it: RowIterator<'static>,
@@ -82,7 +85,7 @@ struct Frame {
 }
 
 impl Session {
-    pub fn new(host: String, port: u16, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(target: Target, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (cols, rows) = (80, 24);
         let outbox = Rc::new(RefCell::new(Vec::new()));
         let title_dirty = Rc::new(Cell::new(false));
@@ -105,13 +108,12 @@ impl Session {
             .expect("terminal callbacks");
 
         let mut this = Self {
-            host,
-            port,
+            telnet: None,
+            target,
             status: Status::Connecting,
             focus: cx.focus_handle(),
             conn: None,
             _reader: None,
-            telnet: Telnet::new(cols, rows),
             term,
             render: RenderState::new().expect("render state"),
             rows_it: RowIterator::new().expect("row iterator"),
@@ -132,10 +134,10 @@ impl Session {
 
     pub fn connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.status = Status::Connecting;
-        self.telnet = Telnet::new(self.grid.0, self.grid.1);
+        self.telnet = matches!(self.target, Target::Tcp { .. }).then(|| Telnet::new(self.grid.0, self.grid.1));
         self.line.clear();
         self.term.reset();
-        let (conn, rx) = Connection::open(self.host.clone(), self.port);
+        let (conn, rx) = Connection::open(self.target.clone());
         self.conn = Some(conn);
         self._reader = Some(cx.spawn_in(window, async move |this, cx| {
             while let Ok(ev) = rx.recv().await {
@@ -144,24 +146,30 @@ impl Session {
                 }
             }
         }));
-        window.set_window_title(&format!("tent — {}", self.host));
+        window.set_window_title(&format!("tent — {}", self.target.label()));
         cx.notify();
     }
 
     fn on_net(&mut self, ev: NetEvent, window: &mut Window, cx: &mut Context<Self>) {
         match ev {
-            NetEvent::Connected => self.status = Status::Connected,
+            NetEvent::Connected => {
+                self.status = Status::Connected;
+                cx.emit(SessionEvent::Connected);
+            }
             NetEvent::Data(bytes) => {
-                let r = self.telnet.receive(&bytes);
-                self.send_raw(r.reply);
-                self.term.vt_write(&r.data);
-                let replies = std::mem::take(&mut *self.outbox.borrow_mut());
-                if !replies.is_empty() {
-                    self.send_raw(self.telnet.encode(&replies));
+                match &mut self.telnet {
+                    Some(t) => {
+                        let r = t.receive(&bytes);
+                        self.send_raw(r.reply);
+                        self.term.vt_write(&r.data);
+                    }
+                    None => self.term.vt_write(&bytes),
                 }
+                let replies = std::mem::take(&mut *self.outbox.borrow_mut());
+                self.send_data(&replies);
                 if self.title_dirty.replace(false) {
                     let t = self.term.title().unwrap_or_default();
-                    let t = if t.is_empty() { self.host.clone() } else { t.to_string() };
+                    let t = if t.is_empty() { self.target.label() } else { t.to_string() };
                     window.set_window_title(&format!("tent — {t}"));
                 }
             }
@@ -179,18 +187,31 @@ impl Session {
         }
     }
 
+    /// Send application data, escaping it for telnet if needed.
+    fn send_data(&self, bytes: &[u8]) {
+        match &self.telnet {
+            Some(t) => self.send_raw(t.encode(bytes)),
+            None => self.send_raw(bytes.to_vec()),
+        }
+    }
+
+    /// Char mode: the peer echoes. Always true for serial.
+    fn remote_echo(&self) -> bool {
+        self.telnet.as_ref().is_none_or(Telnet::remote_echo)
+    }
+
     /// Send keyboard-originated bytes, applying NVT line mode if the server
     /// doesn't echo.
     fn send_input(&mut self, bytes: &[u8]) {
-        if self.telnet.remote_echo() || bytes.first() == Some(&0x1b) && !self.line.is_empty() {
-            if !self.telnet.remote_echo() {
+        if self.remote_echo() || bytes.first() == Some(&0x1b) && !self.line.is_empty() {
+            if !self.remote_echo() {
                 return; // escape sequences mid-line would corrupt the line
             }
-            self.send_raw(self.telnet.encode(bytes));
+            self.send_data(bytes);
             return;
         }
         if bytes.first() == Some(&0x1b) {
-            self.send_raw(self.telnet.encode(bytes));
+            self.send_data(bytes);
             return;
         }
         let mut echo = Vec::new();
@@ -199,7 +220,7 @@ impl Session {
                 '\r' | '\n' => {
                     let mut out = std::mem::take(&mut self.line).into_bytes();
                     out.extend_from_slice(b"\r\n");
-                    self.send_raw(self.telnet.encode(&out));
+                    self.send_data(&out);
                     echo.extend_from_slice(b"\r\n");
                 }
                 '\x7f' | '\x08' => {
@@ -208,7 +229,7 @@ impl Session {
                     }
                 }
                 c if (c as u32) < 0x20 => {
-                    self.send_raw(self.telnet.encode(&[c as u8]));
+                    self.send_data(&[c as u8]);
                 }
                 c => {
                     self.line.push(c);
@@ -226,7 +247,7 @@ impl Session {
         }
         self.grid = (cols, rows);
         let _ = self.term.resize(cols, rows, f32::from(cell.width) as u32, f32::from(cell.height) as u32);
-        if let Some(naws) = self.telnet.resize(cols, rows) {
+        if let Some(naws) = self.telnet.as_mut().and_then(|t| t.resize(cols, rows)) {
             self.send_raw(naws);
         }
         cx.notify();
@@ -538,10 +559,19 @@ impl Render for Session {
         let (dot, label): (u32, SharedString) = match &self.status {
             Status::Connecting => (theme::WARN, "connecting…".into()),
             Status::Connected => (theme::OK, "connected".into()),
-            Status::Closed(None) => (theme::ERR, "connection closed".into()),
-            Status::Closed(Some(e)) => (theme::ERR, e.clone().into()),
+            Status::Closed(_) => (theme::ERR, "disconnected".into()),
         };
-        let mode = if self.telnet.remote_echo() { "char" } else { "line" };
+        // Shown in the overlay, where there's room for a full error message.
+        let reason: SharedString = match &self.status {
+            Status::Closed(Some(e)) => e.clone().into(),
+            Status::Closed(None) => "connection closed".into(),
+            _ => "".into(),
+        };
+        let mode = match &self.target {
+            Target::Serial(s) => s.settings(),
+            _ if self.remote_echo() => "char mode".into(),
+            _ => "line mode".into(),
+        };
 
         div()
             .key_context("Session")
@@ -564,11 +594,12 @@ impl Render for Session {
                     .border_color(c(theme::BORDER))
                     .text_size(px(12.))
                     .text_color(c(theme::MUTED))
-                    .child(div().size(px(7.)).rounded_full().bg(c(dot)))
+                    .child(div().flex_none().size(px(7.)).rounded_full().bg(c(dot)))
                     .child(
                         div()
+                            .flex_none()
                             .text_color(c(theme::FG))
-                            .child(format!("{}:{}", self.host, self.port)),
+                            .child(self.target.label()),
                     )
                     .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().child(label))
                     .child(div().flex_1())
@@ -579,7 +610,7 @@ impl Render for Session {
                                 .rounded_sm()
                                 .border_1()
                                 .border_color(c(theme::BORDER))
-                                .child(format!("{mode} mode")),
+                                .child(mode),
                         )
                     })
                     .child(format!("{}×{}", self.grid.0, self.grid.1)),
@@ -593,12 +624,17 @@ impl Render for Session {
                             .bottom(px(16.))
                             .left_0()
                             .right_0()
+                            .px_4()
                             .flex()
                             .justify_center()
                             .child(
                                 div()
                                     .flex()
-                                    .gap_3()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_x_3()
+                                    .gap_y_1()
                                     .px_4()
                                     .py_2()
                                     .rounded_lg()
@@ -607,9 +643,9 @@ impl Render for Session {
                                     .border_color(c(theme::BORDER))
                                     .text_size(px(12.))
                                     .text_color(c(theme::MUTED))
-                                    .child(div().text_color(c(theme::FG)).child("disconnected"))
-                                    .child(hint("↵", "reconnect"))
-                                    .child(hint("esc", "hosts")),
+                                    .child(div().max_w_full().text_color(c(theme::FG)).child(reason))
+                                    .child(div().flex_none().child(hint("↵", "reconnect")))
+                                    .child(div().flex_none().child(hint("esc", "hosts"))),
                             ),
                     )
                 },

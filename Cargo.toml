@@ -10,6 +10,7 @@ gpui = "0.2.2"
 libghostty-vt = { version = "0.2.2", default-features = false }
 anyhow = "1"
 async-channel = "2"
+serialport = { version = "4.10", default-features = false }
 
 [profile.release]
 lto = "thin"
